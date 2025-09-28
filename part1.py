@@ -101,6 +101,7 @@ class L1Cache:
         tag = addr >> (self.cfg.off_bits + self.cfg.idx_bits)
         return tag, idx, off
 
+    # if line is alreayd inside the cache, return it; else None
     def _find_line(self, idx: int, tag: int) -> Optional[CacheLine]:
         for line in self.sets[idx].lines:
             if line.state != LineState.INVALID and line.tag == tag:
@@ -184,6 +185,7 @@ class L1Cache:
             return HIT_CYCLES
 
         # Miss (write-allocate)
+        self.stats.misses += 1
         victim = self._select_victim(idx)
 
         latency = 0

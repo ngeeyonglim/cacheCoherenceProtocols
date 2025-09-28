@@ -1,1 +1,3 @@
 *_four/
+*.data
+coherence_cpp
