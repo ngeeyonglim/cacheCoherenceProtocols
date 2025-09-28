@@ -79,7 +79,7 @@ public:
 
         // Miss
         misses++;
-        cycles += 100; // miss penalty = fetch from DRAM (100 cycles)
+        cycles += 101; // miss penalty = fetch from DRAM (100 cycles)
 
         // Find victim (LRU)
         int victim = 0;
@@ -167,8 +167,10 @@ public:
                 bool isWrite = (label == 1);
 
                 long cyclesBefore = totalCycles;
-                cache.access(addr, isWrite, totalCycles);
-                idleCycles += (totalCycles - cyclesBefore);
+                if (!cache.access(addr, isWrite, totalCycles))
+                {
+                    idleCycles += (totalCycles - cyclesBefore);
+                }
 
                 if (isWrite)
                     stores++;
@@ -195,7 +197,7 @@ public:
  */
 int main(int argc, char *argv[])
 {
-    if (argc != 5)
+    if (argc != 6)
     {
         cerr << "Usage: coherence protocol input_file cache_size associativity block_size" << endl;
         return 1;
