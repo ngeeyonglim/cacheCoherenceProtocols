@@ -37,7 +37,7 @@ class CacheLine:
     tag: int = -1
     state: str = LineState.INVALID
     dirty: bool = False
-    lru_tick: int = 0  # lower = more recently used
+    lru_tick: int = 0  # larger
 
 @dataclass
 class CacheSet:
@@ -108,12 +108,12 @@ class L1Cache:
         return None
 
     def _select_victim(self, idx: int) -> CacheLine:
-        # Prefer INVALID if available, else LRU (smallest lru_tick == most recent? we invert)
+        # Prefer INVALID if available, else LRU 
         for line in self.sets[idx].lines:
             if line.state == LineState.INVALID:
                 return line
-        # Evict line with largest lru_tick (oldest)
-        return max(self.sets[idx].lines, key=lambda ln: ln.lru_tick)
+        # Evict line with largest lru_tick smallest
+        return min(self.sets[idx].lines, key=lambda ln: ln.lru_tick)
 
     def _touch_lru(self, idx: int, line: CacheLine) -> None:
         line.lru_tick = self.lru.tick()
@@ -246,17 +246,6 @@ class SingleCoreCPU:
             idle = max(0, latency - 1)  # treat the extra beyond the 1-cycle access as idle
             self.stats.idle_cycles += idle
             self.time += latency
-
-# --------------- Multi-core hooks (for Part 2) -------------------
-# You will later introduce:
-# - A Bus (FCFS queue) that carries BusRd/BusRdX/BusUpgr/Writeback/Update.
-# - A CoherenceController that orchestrates snoops and state transitions
-#   (MESI or Dragon). Each cache listens and updates its lines.
-# - Round-robin or event-driven advancement so each core issues at most
-#   one memory reference per cycle; compute gaps (OTHER) still advance
-#   per-core time.
-#
-# For Part 1, Bus is implicit (single core), but we still track bus_data_bytes.
 
 # --------------- CLI & Orchestration -----------------------------
 
