@@ -55,6 +55,7 @@ public:
         uint32_t tag = blockAddr / numSets;
 
         auto &set = sets[setIndex];
+        cycles += 1; // hit time = 1 cycle
 
         // Search for hit
         for (int i = 0; i < associativity; i++)
@@ -63,7 +64,6 @@ public:
             {
                 // Hit
                 hits++;
-                cycles += 1; // cache hit = 1 cycle
                 // update LRU
                 set[i].lruCounter = 0;
                 for (int j = 0; j < associativity; j++)
@@ -79,7 +79,7 @@ public:
 
         // Miss
         misses++;
-        cycles += 101; // miss penalty = fetch from DRAM (100 cycles)
+        cycles += 100; // miss penalty = fetch from DRAM (100 cycles)
 
         // Find victim (LRU)
         int victim = 0;
@@ -169,7 +169,7 @@ public:
                 long cyclesBefore = totalCycles;
                 if (!cache.access(addr, isWrite, totalCycles))
                 {
-                    idleCycles += (totalCycles - cyclesBefore);
+                    idleCycles += (totalCycles - cyclesBefore - 1); // exclude access time
                 }
 
                 if (isWrite)
