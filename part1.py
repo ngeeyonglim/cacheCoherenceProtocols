@@ -19,7 +19,8 @@ WORD_BYTES = 4  # 32-bit word
 HIT_CYCLES = 1
 MEM_FETCH_BLOCK_CYCLES = 100       # miss service from memory
 DIRTY_EVICT_TO_MEM_CYCLES = 100    # writeback dirty block to memory
-C2C_WORD_CYCLES = 2                # (unused in Part 1; used in Dragon/MESI cache-to-cache)
+# (unused in Part 1; used in Dragon/MESI cache-to-cache)
+C2C_WORD_CYCLES = 2
 
 # --------- Labels in the trace ----------
 LOAD = 0
@@ -27,10 +28,13 @@ STORE = 1
 OTHER = 2
 
 # --------- Cache line states (subset for Part 1; expand for MESI/Dragon) ----------
+
+
 class LineState:
     INVALID = "I"
     EXCLUSIVE = "E"  # single-core: first read miss can be E
     MODIFIED = "M"   # single-core: after a write
+
 
 @dataclass
 class CacheLine:
@@ -39,9 +43,11 @@ class CacheLine:
     dirty: bool = False
     lru_tick: int = 0  # larger
 
+
 @dataclass
 class CacheSet:
     lines: List[CacheLine]
+
 
 @dataclass
 class CacheConfig:
@@ -50,7 +56,8 @@ class CacheConfig:
     block_bytes: int
 
     def __post_init__(self):
-        assert self.size_bytes % (self.assoc * self.block_bytes) == 0, "Invalid cache geometry"
+        assert self.size_bytes % (
+            self.assoc * self.block_bytes) == 0, "Invalid cache geometry"
 
     @property
     def num_sets(self) -> int:
@@ -63,6 +70,7 @@ class CacheConfig:
     @property
     def off_bits(self) -> int:
         return int(math.log2(self.block_bytes))
+
 
 @dataclass
 class CacheStats:
@@ -77,21 +85,26 @@ class CacheStats:
     private_accesses: int = 0          # accesses to E/M (private)
     shared_accesses: int = 0           # accesses to S state (for Part 1, 0)
 
+
 class LRU:
     """Monotonic counter used to implement LRU across lines."""
+
     def __init__(self): self.t = 0
     def tick(self) -> int: self.t += 1; return self.t
+
 
 class L1Cache:
     """
     Blocking, write-back, write-allocate, LRU.
     Single-core behavior for Part 1 (no snoops).
     """
+
     def __init__(self, cfg: CacheConfig, stats: CacheStats):
         self.cfg = cfg
         self.stats = stats
         self.lru = LRU()
-        self.sets = [CacheSet([CacheLine() for _ in range(cfg.assoc)]) for _ in range(cfg.num_sets or 1)]
+        self.sets = [CacheSet([CacheLine() for _ in range(cfg.assoc)])
+                     for _ in range(cfg.num_sets or 1)]
 
     def _addr_fields(self, addr: int) -> Tuple[int, int, int]:
         off_mask = (1 << self.cfg.off_bits) - 1
@@ -101,7 +114,7 @@ class L1Cache:
         tag = addr >> (self.cfg.off_bits + self.cfg.idx_bits)
         return tag, idx, off
 
-    # if line is alreayd inside the cache, return it; else None
+    # if line is already inside the cache, return it; else None
     def _find_line(self, idx: int, tag: int) -> Optional[CacheLine]:
         for line in self.sets[idx].lines:
             if line.state != LineState.INVALID and line.tag == tag:
@@ -109,7 +122,7 @@ class L1Cache:
         return None
 
     def _select_victim(self, idx: int) -> CacheLine:
-        # Prefer INVALID if available, else LRU 
+        # Prefer INVALID if available, else LRU
         for line in self.sets[idx].lines:
             if line.state == LineState.INVALID:
                 return line
@@ -204,11 +217,13 @@ class L1Cache:
 
         return latency + HIT_CYCLES
 
+
 class TraceReader:
     """
     Reads a single core's trace file: lines 'Label Value'.
     OTHER lines provide compute cycles (Value is hex).
     """
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -216,11 +231,13 @@ class TraceReader:
         with self.path.open('r') as f:
             for line in f:
                 line = line.strip()
-                if not line: continue
+                if not line:
+                    continue
                 a, b = line.split()
                 label = int(a)
                 val = int(b, 16 if b.lower().startswith("0x") else 10)
                 yield label, val
+
 
 @dataclass
 class SingleCoreCPU:
@@ -245,11 +262,13 @@ class SingleCoreCPU:
                 raise ValueError(f"Unknown label {label}")
 
             # All miss service time is idle (core stalled); even hits cost 1 cycle "busy".
-            idle = max(0, latency - 1)  # treat the extra beyond the 1-cycle access as idle
-            self.stats.idle_cycles += idle
+            # treat the extra beyond the 1-cycle access as idle
+            idle = max(0, latency - 1)
+            self.stats.idle_cycles += idle + 1
             self.time += latency
 
 # --------------- CLI & Orchestration -----------------------------
+
 
 def resolve_trace_path(benchmark_base: str, traces_root: Optional[Path]) -> Path:
     """
@@ -258,8 +277,10 @@ def resolve_trace_path(benchmark_base: str, traces_root: Optional[Path]) -> Path
     """
     # Default search locations: current dir, provided root, or SoC path env.
     candidates = []
-    if traces_root: candidates.append(traces_root)
-    candidates += [Path.cwd(), Path("/home/course/cs4223/assignments/assignment2")]
+    if traces_root:
+        candidates.append(traces_root)
+    candidates += [Path.cwd(),
+                   Path("/home/course/cs4223/assignments/assignment2")]
 
     fname = f"{benchmark_base}_0.data"
     for root in candidates:
@@ -267,6 +288,7 @@ def resolve_trace_path(benchmark_base: str, traces_root: Optional[Path]) -> Path
         if p.exists():
             return p
     raise FileNotFoundError(f"Could not find {fname} under {candidates}")
+
 
 def run_single_core(protocol: str, benchmark_base: str, cfg: CacheConfig, traces_root: Optional[Path]) -> Tuple[SingleCoreCPU, CacheStats]:
     stats = CacheStats()
@@ -277,42 +299,58 @@ def run_single_core(protocol: str, benchmark_base: str, cfg: CacheConfig, traces
     core.exec_trace(tr)
     return core, stats
 
+
 def human_bytes(n: int) -> str:
-    for unit in ["B","KB","MB","GB"]:
-        if n < 1024: return f"{n} {unit}"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n} {unit}"
         n //= 1024
     return f"{n} TB"
 
+
 def main():
-    ap = argparse.ArgumentParser(description="Trace-driven cache coherence simulator")
-    ap.add_argument("protocol", choices=["MESI", "Dragon"], help="Coherence protocol (for Part 2). Part 1 ignores.")
-    ap.add_argument("input_file", help="Benchmark base name (e.g., bodytrack, blackscholes, fluidanimate)")
+    ap = argparse.ArgumentParser(
+        description="Trace-driven cache coherence simulator")
+    ap.add_argument("protocol", choices=[
+                    "MESI", "Dragon"], help="Coherence protocol (for Part 2). Part 1 ignores.")
+    ap.add_argument(
+        "input_file", help="Benchmark base name (e.g., bodytrack, blackscholes, fluidanimate)")
     ap.add_argument("cache_size", type=int, help="L1 size in bytes")
     ap.add_argument("associativity", type=int, help="L1 associativity")
     ap.add_argument("block_size", type=int, help="L1 block size in bytes")
-    ap.add_argument("--traces-root", type=Path, default=None, help="Directory with *_N.data files")
+    ap.add_argument("--traces-root", type=Path, default=None,
+                    help="Directory with *_N.data files")
     args = ap.parse_args()
 
-    cfg = CacheConfig(size_bytes=args.cache_size, assoc=args.associativity, block_bytes=args.block_size)
+    cfg = CacheConfig(size_bytes=args.cache_size,
+                      assoc=args.associativity, block_bytes=args.block_size)
 
     # Part 1: single-core
-    core, stats = run_single_core(args.protocol, args.input_file, cfg, args.traces_root)
+    core, stats = run_single_core(
+        args.protocol, args.input_file, cfg, args.traces_root)
 
     # ----- Output (machine-readable-ish then human summary) -----
     # Core-level (only one core for Part 1)
     print("==== RESULTS ====")
     print(f"protocol={args.protocol}")
     print(f"benchmark={args.input_file}")
-    print(f"cache_size_bytes={cfg.size_bytes} assoc={cfg.assoc} block_bytes={cfg.block_bytes}")
-    print(f"overall_exec_cycles={core.time}")           # For multi-core later: max across cores
+    print(
+        f"cache_size_bytes={cfg.size_bytes} assoc={cfg.assoc} block_bytes={cfg.block_bytes}")
+    # For multi-core later: max across cores
+    print(f"overall_exec_cycles={core.time}")
     print(f"core0_exec_cycles={core.time}")
     print(f"core0_compute_cycles={stats.compute_cycles}")
     print(f"core0_loads={stats.loads} core0_stores={stats.stores}")
     print(f"core0_hits={stats.hits} core0_misses={stats.misses}")
     print(f"core0_idle_cycles={stats.idle_cycles}")
-    print(f"bus_data_traffic_bytes={stats.bus_data_bytes} ({human_bytes(stats.bus_data_bytes)})")
-    print(f"bus_invals_or_updates={stats.invalidations_or_updates}")  # 0 for single-core
-    print(f"private_accesses={stats.private_accesses} shared_accesses={stats.shared_accesses}")  # shared=0 in Part 1
+    print(
+        f"bus_data_traffic_bytes={stats.bus_data_bytes} ({human_bytes(stats.bus_data_bytes)})")
+    # 0 for single-core
+    print(f"bus_invals_or_updates={stats.invalidations_or_updates}")
+    # shared=0 in Part 1
+    print(
+        f"private_accesses={stats.private_accesses} shared_accesses={stats.shared_accesses}")
+
 
 if __name__ == "__main__":
     main()
