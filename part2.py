@@ -41,7 +41,7 @@ class BusTxnType:
     BusRd  = "BusRd"   # read miss (shared if others have it)
     BusRdX = "BusRdX"  # read for ownership (write miss)
     BusUpg = "BusUpgr" # no need to fetch data from other caches
-    BusWB  = "BusWB"   # writeback on eviction (M only)
+    BusWB  = "BusWB"   # FLUSH 
 
 @dataclass
 class CacheLine:
@@ -166,11 +166,11 @@ class Bus:
         owner_supplies = False
         inval_count = 0
 
-        # Broadcast snoop to all *other* caches
+        # broadcast snoop to other caches
         for cid, snp in enumerate(self.snoopers):
             if cid == txn.src_core:
                 continue
-            had, supplied, invalidated = snp.on_snoop(txn)
+            had, supplied, invalidated = snp.on_snoop(txn) # check behaviour of the other caches 
             if had:
                 shared = True
             if supplied:
@@ -179,9 +179,9 @@ class Bus:
                 inval_count += 1
 
         # Decide data source + latency and account data traffic
-        if txn.ttype == BusTxnType.BusUpg:
+        if txn.ttype == BusTxnType.BusUpg: # busupg for S -> M, as the request core doesnt need to get data
             latency = 1  # control only
-            data_source = 'mem'  # N/A; keep 'mem' as placeholder
+            data_source = 'mem'  # placeholder
         elif txn.ttype == BusTxnType.BusWB:
             latency = DIRTY_EVICT_TO_MEM_CYCLES
             data_source = 'mem'
@@ -190,6 +190,7 @@ class Bus:
             self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
         else:
             # Data-carrying (BusRd / BusRdX)
+            # flow based on which method of data transfer 
             if owner_supplies:
                 latency = C2C_WORD_CYCLES * self._block_words()
                 data_source = 'c2c'
@@ -210,9 +211,6 @@ class Bus:
 
 # -------------------- L1 cache with MESI controller --------------------
 class L1Cache(Snooper):
-    """
-    Blocking, write-back, write-allocate, LRU. MESI snooping controller.
-    """
     def __init__(self, cfg: CacheConfig, stats: CacheStats, core_id: int, bus: Bus):
         self.cfg = cfg
         self.stats = stats
@@ -245,7 +243,6 @@ class L1Cache(Snooper):
     def _touch_lru(self, line: CacheLine) -> None:
         line.lru_tick = self.lru.tick()
 
-    # ---------- Processor-side API ----------
     def on_pr_rd(self, addr: int, core_time: int) -> int:
         self.stats.loads += 1
         tag, idx, _ = self._addr_fields(addr)
@@ -312,6 +309,12 @@ class L1Cache(Snooper):
                 self._touch_lru(line)
                 self.stats.private_accesses += 1
                 return bus_lat + HIT_CYCLES
+            
+
+        # BUS txn time: 5->105
+        # CPU cycle time: 7
+        # 105
+
 
         # Miss in I: write-allocate via BusRdX
         self.stats.misses += 1
@@ -334,7 +337,9 @@ class L1Cache(Snooper):
         self.stats.private_accesses += 1
         return latency + HIT_CYCLES
 
-    # ---------- Snooping (other cores' bus txns) ----------
+    '''
+    handles the logic for the behaviour of the cache given the bus txn type
+    '''
     def on_snoop(self, txn: BusTxn) -> Tuple[bool, bool, bool]:
         tag, idx, _ = self._addr_fields(txn.addr)
         line = self._find_line(idx, tag)
@@ -446,7 +451,7 @@ class Simulator:
                           if self._core_has_work(cid)]
             if not candidates:
                 break
-            # FCFS tie-breaker: by (time, core_id)
+            # will always pick the core with the lowest local time, so that process order makes sense
             candidates.sort(key=lambda x: (x[1], x[0]))
             cid, _ = candidates[0]
             core = self.cores[cid]
@@ -483,11 +488,11 @@ def main():
     ap = argparse.ArgumentParser(description="Trace-driven cache coherence simulator (MESI)")
     ap.add_argument("protocol", choices=["MESI", "Dragon"], help="Coherence protocol (Dragon not implemented; use MESI).")
     ap.add_argument("input_file", help="Benchmark base name (e.g., bodytrack, blackscholes, fluidanimate)")
-    ap.add_argument("cache_size", type=int, help="L1 size in bytes")
-    ap.add_argument("associativity", type=int, help="L1 associativity")
-    ap.add_argument("block_size", type=int, help="L1 block size in bytes")
+    ap.add_argument("cache_size", default = 4096, type=int, help="L1 size in bytes")
+    ap.add_argument("associativity", default = 2, type=int, help="L1 associativity")
+    ap.add_argument("block_size", default=32, type=int, help="L1 block size in bytes")
     ap.add_argument("--traces-root", type=Path, default=None, help="Directory with *_N.data files")
-    ap.add_argument("--num-cores", type=int, default=1, help="Number of cores to simulate")
+    ap.add_argument("--num-cores", type=int, default=4, help="Number of cores to simulate")
     args = ap.parse_args()
 
     cfg = CacheConfig(size_bytes=args.cache_size, assoc=args.associativity, block_bytes=args.block_size)
