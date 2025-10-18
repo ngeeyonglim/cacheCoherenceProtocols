@@ -9,6 +9,7 @@
 
 import argparse
 import math
+import heapq
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
@@ -19,13 +20,12 @@ WORD_BYTES = 4  # 32-bit word
 HIT_CYCLES = 1
 MEM_FETCH_BLOCK_CYCLES = 100       # miss service from memory
 DIRTY_EVICT_TO_MEM_CYCLES = 100    # writeback dirty block to memory
-# (unused in Part 1; used in Dragon/MESI cache-to-cache)
 C2C_WORD_CYCLES = 2
 
 # --------- Labels in the trace ----------
-LOAD = 0    # [cite: 25]
-STORE = 1   # [cite: 25]
-OTHER = 2   # [cite: 25]
+LOAD = 0
+STORE = 1
+OTHER = 2
 
 # --------- Cache line states (MESI) ----------
 
@@ -112,15 +112,15 @@ class LRU:
 class Bus:
     """
     FCFS shared bus. Manages transactions and snooping.
-    A transaction takes multiple cycles to complete.
+    A transaction is now an event, not a tick-based process.
     """
 
-    def __init__(self, global_stats: GlobalStats):
+    def __init__(self, global_stats: GlobalStats, sim: 'Simulator'):
         self.g_stats = global_stats
+        self.sim = sim
         self.queue = deque()
         self.snoopers: List['L1Cache'] = []
-        self.current_xact: Optional[Dict[str, Any]] = None
-        self.cycles_rem: int = 0
+        self.is_busy: bool = False
 
     def add_snooper(self, cache: 'L1Cache'):
         self.snoopers.append(cache)
@@ -128,24 +128,19 @@ class Bus:
     def push_request(self, core_id: int, xact_type: str, addr: int):
         self.queue.append(
             {'core_id': core_id, 'type': xact_type, 'addr': addr})
+        self.try_start_next_xact()
 
-    def tick(self):
-        if not self.current_xact:
-            if not self.queue:
-                return  # Bus is idle
-            # Start a new transaction
-            self.current_xact = self.queue.popleft()
-            self.process_new_xact()
+    def try_start_next_xact(self):
+        """If the bus is free and has pending requests, start one."""
+        if self.is_busy or not self.queue:
+            return  # Bus is busy or no work to do
 
-        self.cycles_rem -= 1
+        self.is_busy = True
+        xact = self.queue.popleft()
+        self.process_new_xact(xact)
 
-        if self.cycles_rem <= 0:
-            self.finish_current_xact()
-            self.current_xact = None
-
-    def process_new_xact(self):
-        """Snoop other caches and determine latency for the new transaction."""
-        xact = self.current_xact
+    def process_new_xact(self, xact: Dict[str, Any]):
+        """Snoop other caches, determine latency, and schedule completion event."""
         req_core_id, xact_type, addr = xact['core_id'], xact['type'], xact['addr']
 
         # Snoop all OTHER caches
@@ -155,56 +150,58 @@ class Bus:
                 snoop_responses.append(snooper.snoop(xact_type, addr))
 
         was_dirty = LineState.MODIFIED in snoop_responses
-        # checks if any other cache has a valid copy (M, E, or S).
         is_shared = any(r is not None for r in snoop_responses)
 
+        latency = 0
+        block_bytes = self.snoopers[0].cfg.block_bytes
+        words_per_block = self.snoopers[0].cfg.words_per_block
+
         if xact_type == BusXact.BusRd:
-            if was_dirty:
-                # Cache-to-cache transfer
-                self.cycles_rem = C2C_WORD_CYCLES * \
-                    self.snoopers[0].cfg.words_per_block
-                self.g_stats.bus_data_bytes += self.snoopers[0].cfg.block_bytes
+            if was_dirty or is_shared:
+                latency = C2C_WORD_CYCLES * words_per_block
+                self.g_stats.bus_data_bytes += block_bytes
             else:
-                # Memory fetch
-                self.cycles_rem = MEM_FETCH_BLOCK_CYCLES
-                self.g_stats.bus_data_bytes += self.snoopers[0].cfg.block_bytes
-            # Determine final state for requesting cache
+                latency = MEM_FETCH_BLOCK_CYCLES
+                self.g_stats.bus_data_bytes += block_bytes
             xact['final_state'] = LineState.SHARED if is_shared else LineState.EXCLUSIVE
 
         elif xact_type == BusXact.BusRdX:
-            # Invalidation count is handled by snooping caches
             if was_dirty:
-                # C2C transfer
-                self.cycles_rem = C2C_WORD_CYCLES * \
-                    self.snoopers[0].cfg.words_per_block
-                self.g_stats.bus_data_bytes += self.snoopers[0].cfg.block_bytes
+                latency = C2C_WORD_CYCLES * words_per_block
+                self.g_stats.bus_data_bytes += block_bytes
             else:
-                # Memory fetch
-                self.cycles_rem = MEM_FETCH_BLOCK_CYCLES
-                self.g_stats.bus_data_bytes += self.snoopers[0].cfg.block_bytes
+                latency = MEM_FETCH_BLOCK_CYCLES
+                self.g_stats.bus_data_bytes += block_bytes
             xact['final_state'] = LineState.MODIFIED
 
         elif xact_type == BusXact.Flush:
-            # This is a writeback due to eviction
-            self.cycles_rem = DIRTY_EVICT_TO_MEM_CYCLES
-            self.g_stats.bus_data_bytes += self.snoopers[0].cfg.block_bytes
-            xact['final_state'] = None  # No state change for others
+            latency = DIRTY_EVICT_TO_MEM_CYCLES
+            self.g_stats.bus_data_bytes += block_bytes
+            xact['final_state'] = None
 
-    def finish_current_xact(self):
-        """Notify the originating cache that its transaction is complete."""
-        xact = self.current_xact
-        if xact['type'] != BusXact.Flush:  # Flushes don't need a response
+        self.sim.schedule(latency, self.finish_current_xact, xact)
+
+    def finish_current_xact(self, xact: Dict[str, Any]):
+        """Event callback when a bus transaction completes."""
+        self.is_busy = False  # Free the bus
+
+        # Notify the originating cache
+        if xact['type'] != BusXact.Flush:
             origin_cache = self.snoopers[xact['core_id']]
             origin_cache.complete_request(xact['addr'], xact['final_state'])
 
+        # Try to start the next transaction in the queue
+        self.try_start_next_xact()
+
 
 class L1Cache:
-    def __init__(self, core_id: int, cfg: CacheConfig, stats: CacheStats, bus: Bus, g_stats: GlobalStats):
+    def __init__(self, core_id: int, cfg: CacheConfig, stats: CacheStats, bus: Bus, g_stats: GlobalStats, cpu: 'CPU'):
         self.core_id = core_id
         self.cfg = cfg
         self.stats = stats
         self.bus = bus
         self.g_stats = g_stats
+        self.cpu = cpu
         self.lru = LRU()
         self.sets = [CacheSet([CacheLine() for _ in range(cfg.assoc)])
                      for _ in range(cfg.num_sets)]
@@ -224,7 +221,6 @@ class L1Cache:
         return None
 
     def _select_victim(self, idx: int) -> CacheLine:
-        # Prefer INVALID if available, else LRU
         for line in self.sets[idx].lines:
             if line.state == LineState.INVALID:
                 return line
@@ -233,10 +229,10 @@ class L1Cache:
     def _touch_lru(self, line: CacheLine):
         line.lru_tick = self.lru.tick()
 
-    def access(self, addr: int, access_type: int) -> bool:
+    def access(self, addr: int, access_type: int) -> Tuple[bool, int]:
         """
-        Returns True if hit, False if miss (and queues bus request).
-        Mutates stats.
+        Returns (is_hit, latency). On miss, returns (False, 0)
+        and queues a bus request.
         """
         is_load = (access_type == LOAD)
         if is_load:
@@ -249,10 +245,9 @@ class L1Cache:
 
         if not line:  # Miss
             self.stats.misses += 1
-            # Issue BusRd on read miss, BusRdX on write miss
             xact_type = BusXact.BusRd if is_load else BusXact.BusRdX
             self.bus.push_request(self.core_id, xact_type, addr)
-            return False  # Stall
+            return (False, 0)
 
         # Hit
         self.stats.hits += 1
@@ -262,42 +257,38 @@ class L1Cache:
         else:  # Shared
             self.stats.shared_accesses += 1
 
-        if is_load:  # Load
+        if is_load:  # Load Hit
             self._touch_lru(line)
-            return True
-        else:  # Store
-            if line.state == LineState.MODIFIED:
-                self._touch_lru(line)
-                return True
-            elif line.state == LineState.EXCLUSIVE:
+            return (True, HIT_CYCLES)
+        else:  # Store Hit
+            if line.state in (LineState.MODIFIED, LineState.EXCLUSIVE):
                 line.state = LineState.MODIFIED
                 self._touch_lru(line)
-                return True
+                return (True, HIT_CYCLES)
             elif line.state == LineState.SHARED:
                 # Upgrade S -> M. Need to invalidate others.
                 self.bus.push_request(self.core_id, BusXact.BusRdX, addr)
-                return False  # Stall
+                return (False, 0)
 
     def complete_request(self, addr: int, final_state: str):
         """Callback from the bus when our memory request is done."""
         tag, idx, off = self._addr_fields(addr)
 
-        # Check if we are upgrading a shared line
         line = self._find_line(idx, tag)
         if line and line.state == LineState.SHARED:  # S->M upgrade
             line.state = LineState.MODIFIED
             self._touch_lru(line)
-            return
+        else:  # Miss fill
+            victim = self._select_victim(idx)
+            if victim.state == LineState.MODIFIED:
+                victim_addr = self._reconstruct_addr(victim.tag, idx)
+                self.bus.push_request(self.core_id, BusXact.Flush, victim_addr)
 
-        # Otherwise, it's a miss fill
-        victim = self._select_victim(idx)
-        if victim.state == LineState.MODIFIED:
-            victim_addr = self._reconstruct_addr(victim.tag, idx)
-            self.bus.push_request(self.core_id, BusXact.Flush, victim_addr)
+            victim.tag = tag
+            victim.state = final_state
+            self._touch_lru(victim)
 
-        victim.tag = tag
-        victim.state = final_state
-        self._touch_lru(victim)
+        self.cpu.un_stall()
 
     def snoop(self, xact_type: str, addr: int) -> Optional[str]:
         """Process a snooped transaction. Return line state if we have it."""
@@ -308,18 +299,15 @@ class L1Cache:
 
         original_state = line.state
         if xact_type == BusXact.BusRd:
-            if line.state == LineState.EXCLUSIVE or line.state == LineState.MODIFIED:
+            if line.state in (LineState.EXCLUSIVE, LineState.MODIFIED):
                 line.state = LineState.SHARED
-
         elif xact_type == BusXact.BusRdX:
             if line.state in (LineState.SHARED, LineState.EXCLUSIVE, LineState.MODIFIED):
                 line.state = LineState.INVALID
                 self.g_stats.invalidations_or_updates += 1
-
         return original_state
 
     def _reconstruct_addr(self, tag: int, idx: int) -> int:
-        """Reconstructs the base address of a block from its tag and index."""
         return (tag << (self.cfg.idx_bits + self.cfg.off_bits)) | (idx << self.cfg.off_bits)
 
 
@@ -348,54 +336,90 @@ class TraceReader:
 @dataclass
 class CPU:
     core_id: int
-    l1: L1Cache
+    l1: L1Cache  # Will be set by Simulator after init
     stats: CacheStats
     tr: TraceReader
+    sim: 'Simulator'
 
-    # Core state machine
+    # Core state
     stalled: bool = False
-    compute_cycles_rem: int = 0
+    stall_start_time: int = 0
+    finish_time: int = 0
 
     def is_finished(self) -> bool:
-        return self.tr.finished
+        # Core is finished if its trace is done AND it's not stalled
+        # waiting for a final memory operation.
+        return self.tr.finished and not self.stalled
 
-    def tick(self):
-        if self.stalled or self.is_finished():
-            if not self.is_finished():
-                self.stats.idle_cycles += 1
-            return
-
-        # Currently computing between memory ops
-        if self.compute_cycles_rem > 0:
-            self.compute_cycles_rem -= 1
-            return
+    def execute(self):
+        """
+        This is the main event handler for the CPU.
+        It processes one instruction and schedules its next 'execute' event.
+        """
+        if self.stalled:
+            return  # Waiting for un_stall()
+        if self.tr.finished:
+            return  # This core is done
 
         label, value = self.tr.current_instr
+
         if label == OTHER:
-            self.compute_cycles_rem = value
             self.stats.compute_cycles += value
             self.tr.advance()
+            delay = value
+            if self.tr.finished:
+                # This was the last op. Record finish time.
+                self.finish_time = self.sim.current_time + delay
+            else:
+                # Schedule next execution after compute delay
+                self.sim.schedule(delay, self.execute)
 
-            if self.compute_cycles_rem > 0:
-                self.compute_cycles_rem -= 1
-            return
+        else:  # LOAD or STORE
+            is_hit, latency = self.l1.access(value, label)
 
-        is_hit = self.l1.access(value, label)
-        if is_hit:
-            self.tr.advance()
-        else:
-            self.stalled = True
+            if is_hit:
+                self.tr.advance()
+                if self.tr.finished:
+                    # This was the last op. Record finish time.
+                    self.finish_time = self.sim.current_time + latency
+                else:
+                    # Schedule next execution after hit latency
+                    self.sim.schedule(latency, self.execute)
+            else:
+                # Miss! Stall the CPU and record when the stall began
+                self.stalled = True
+                self.stall_start_time = self.sim.current_time
 
     def un_stall(self):
+        """Callback from L1Cache when a request is complete."""
+        if not self.stalled:
+            return  # Should not happen
+
         self.stalled = False
+
+        # Calculate and add idle time
+        idle_duration = self.sim.current_time - self.stall_start_time
+        self.stats.idle_cycles += idle_duration
+
+        # We missed on this instruction, so now we advance past it
         self.tr.advance()
+
+        if self.tr.finished:
+            # This was the last op. Record finish time.
+            self.finish_time = self.sim.current_time
+        else:
+            # Schedule the next instruction to execute *now*
+            self.sim.schedule(0, self.execute)
 
 
 class Simulator:
     def __init__(self, protocol: str, benchmark: str, cfg: CacheConfig, traces_root: Optional[Path]):
-        self.global_time = 0
+        self.current_time = 0
+        self.event_queue = []
+        self.event_id_counter = 0  # Tie-breaker for events at same time
+
         self.g_stats = GlobalStats()
-        self.bus = Bus(self.g_stats)
+        self.bus = Bus(self.g_stats, self)
         self.cpus: List[CPU] = []
 
         trace_paths = self.resolve_trace_paths(benchmark, traces_root)
@@ -403,14 +427,26 @@ class Simulator:
 
         for i, path in enumerate(trace_paths):
             stats = CacheStats()
-            cache = L1Cache(i, cfg, stats, self.bus, self.g_stats)
-            cpu = CPU(i, cache, stats, TraceReader(path))
-            cache.complete_request = lambda addr, state, c=cpu, self_cache=cache: (
-                c.un_stall(),
-                L1Cache.complete_request(self_cache, addr, state)
-            )
+            # Create CPU and Cache, then link them
+            cpu = CPU(i, None, stats, TraceReader(path), self)
+            cache = L1Cache(i, cfg, stats, self.bus, self.g_stats, cpu)
+            cpu.l1 = cache  # Set the back-link
+
             self.bus.add_snooper(cache)
             self.cpus.append(cpu)
+
+            self.schedule(0, cpu.execute)
+
+    def schedule(self, delay: int, callback: callable, *args):
+        """Add an event to the priority queue."""
+        assert delay >= 0
+        event_time = self.current_time + delay
+
+        # Use a counter for stable sorting if times are equal
+        event = (event_time, self.event_id_counter, callback, args)
+        self.event_id_counter += 1
+
+        heapq.heappush(self.event_queue, event)
 
     def resolve_trace_paths(self, benchmark_base: str, traces_root: Optional[Path]) -> List[Path]:
         candidates = [traces_root] if traces_root else []
@@ -430,12 +466,19 @@ class Simulator:
         return found_paths
 
     def run(self):
-        while any(not cpu.is_finished() for cpu in self.cpus):
-            self.global_time += 1
-            self.bus.tick()
-            for cpu in self.cpus:
-                if not cpu.is_finished():
-                    cpu.tick()
+        """Main discrete event simulation loop."""
+        while self.event_queue:
+            # Get the next event
+            (time, _id, callback, args) = heapq.heappop(self.event_queue)
+
+            # Advance global time to the event's time
+            self.current_time = time
+
+            # Execute the event
+            callback(*args)
+
+        # Simulation is over when the event queue is empty
+        print(f"Simulation finished at time {self.current_time}")
 
     def print_results(self, protocol, benchmark, cfg):
         print("==== RESULTS ====")
@@ -443,24 +486,23 @@ class Simulator:
         print(f"benchmark={benchmark}")
         print(
             f"cache_size_bytes={cfg.size_bytes} assoc={cfg.assoc} block_bytes={cfg.block_bytes}")
-        print(f"overall_exec_cycles={self.global_time}")
 
-        # Loop through each CPU/core and print its specific results
+        overall_max_cycles = 0
+        if self.cpus:
+            overall_max_cycles = max(c.finish_time for c in self.cpus)
+        print(f"overall_exec_cycles={overall_max_cycles}")
+
         for i, cpu in enumerate(self.cpus):
             stats = cpu.stats
-
-            # Final exec time for a core is the global time if it finished
             print(f"--- Core {i} Stats ---")
+            print(f"core{i}_exec_cycles={cpu.finish_time}")
             print(f"core{i}_compute_cycles={stats.compute_cycles}")
             print(f"core{i}_loads={stats.loads} core{i}_stores={stats.stores}")
             print(f"core{i}_hits={stats.hits} core{i}_misses={stats.misses}")
             print(f"core{i}_idle_cycles={stats.idle_cycles}")
-
-            # ADDED: Per-core private and shared access counts
             print(f"core{i}_private_accesses={stats.private_accesses}")
             print(f"core{i}_shared_accesses={stats.shared_accesses}")
 
-        # Print the shared bus statistics once at the end
         print("--- Global Bus Stats ---")
         print(
             f"bus_data_traffic_bytes={self.g_stats.bus_data_bytes} ({human_bytes(self.g_stats.bus_data_bytes)})")
