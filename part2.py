@@ -1,42 +1,29 @@
-#!/usr/bin/env python3
-# coherence.py  (MESI, multicore, snooping bus, C2C from E/M)
-#
 # Usage (examples):
 #   python coherence.py MESI bodytrack 1024 1 16 --num-cores 4
 #   python coherence.py Dragon blackscholes 4096 2 32 --num-cores 2
-#
-# Notes:
-# - Implements MESI with write-back, write-allocate, LRU, blocking L1s.
-# - FCFS bus arbitration; ties broken by smaller core id.
-# - E and M supply C2C data on BusRd; M supplies on BusRdX; E/S invalidate on BusRdX.
-# - One memory ref per cycle per core is respected by virtue of trace timing + blocking.
-#
+
 import argparse
 import math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Literal
 
-# --------- Timing & architectural constants (from spec) ----------
 WORD_BYTES = 4  # 32-bit word
 HIT_CYCLES = 1
 MEM_FETCH_BLOCK_CYCLES = 100       # miss service from memory
 DIRTY_EVICT_TO_MEM_CYCLES = 100    # writeback dirty block to memory
 C2C_WORD_CYCLES = 2                # per 4-byte word across bus (cache->cache)
 
-# --------- Labels in the trace ----------
 LOAD = 0
 STORE = 1
 OTHER = 2
 
-# --------- Cache line MESI states ----------
 class MESI:
     INVALID = "I"
     SHARED = "S"
     EXCLUSIVE = "E"
     MODIFIED = "M"
 
-# --------- Bus transaction types ----------
 class BusTxnType:
     BusRd  = "BusRd"   # read miss (shared if others have it)
     BusRdX = "BusRdX"  # read for ownership (write miss)
@@ -93,7 +80,6 @@ class LRU:
     def __init__(self): self.t = 0
     def tick(self) -> int: self.t += 1; return self.t
 
-# -------------------- Trace reader --------------------
 class TraceReader:
     """
     Reads a single core's trace file: lines 'Label Value'.
@@ -116,7 +102,6 @@ class TraceReader:
                 val = int(b, 16 if b.lower().startswith("0x") else 10) & 0xffffffff
                 yield label, val
 
-# -------------------- Bus & snooping --------------------
 @dataclass
 class BusTxn:
     ttype: str
@@ -144,7 +129,7 @@ class Snooper:
 class Bus:
     """
     Single shared snooping bus, FCFS. One txn at a time.
-    We do simple cycle timing: requester starts at max(core.time, bus.free_at).
+    simple cycle timing: requester starts at max(core.time, bus.free_at).
     """
     def __init__(self, cfg: CacheConfig, snoopers: List[Snooper], stats_per_core: List[CacheStats]):
         self.cfg = cfg
@@ -191,12 +176,12 @@ class Bus:
         else:
             # Data-carrying (BusRd / BusRdX)
             # flow based on which method of data transfer 
-            if owner_supplies:
+            if owner_supplies: # E or M
                 latency = C2C_WORD_CYCLES * self._block_words()
                 data_source = 'c2c'
                 self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
                 self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-            else:
+            else: # if there is other cores with the same block, then memory
                 latency = MEM_FETCH_BLOCK_CYCLES
                 data_source = 'mem'
                 self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
@@ -209,7 +194,6 @@ class Bus:
                        inval_count=inval_count, data_source=data_source)
         return resp, total_latency, t0
 
-# -------------------- L1 cache with MESI controller --------------------
 class L1Cache(Snooper):
     def __init__(self, cfg: CacheConfig, stats: CacheStats, core_id: int, bus: Bus):
         self.cfg = cfg
@@ -269,8 +253,10 @@ class L1Cache(Snooper):
             latency += wb_lat
         # Install incoming block via BusRd
         txn = BusTxn(BusTxnType.BusRd, addr=addr, src_core=self.core_id)
-        resp, bus_lat, _ = self.bus.request(txn, start_time=core_time + latency)
-        latency += bus_lat
+        issued_at = core_time + latency
+        resp, bus_lat, t0 = self.bus.request(txn, start_time=core_time + latency)
+        wait = t0 - issued_at
+        latency += bus_lat + wait
 
         # Fill and set state: E if not shared, else S
         victim.tag = tag
@@ -282,6 +268,7 @@ class L1Cache(Snooper):
             self.stats.private_accesses += 1
         else:
             self.stats.shared_accesses += 1
+    
         return latency + HIT_CYCLES
 
     def on_pr_wr(self, addr: int, core_time: int) -> int:
@@ -313,7 +300,6 @@ class L1Cache(Snooper):
 
         # BUS txn time: 5->105
         # CPU cycle time: 7
-        # 105
 
 
         # Miss in I: write-allocate via BusRdX
@@ -326,9 +312,11 @@ class L1Cache(Snooper):
             _, wb_lat, _ = self.bus.request(txn, start_time=core_time + latency)
             latency += wb_lat
 
+        issued_at = core_time + latency
         txn = BusTxn(BusTxnType.BusRdX, addr=addr, src_core=self.core_id)
-        resp, bus_lat, _ = self.bus.request(txn, start_time=core_time + latency)
-        latency += bus_lat
+        resp, bus_lat, t0 = self.bus.request(txn, start_time=core_time + latency)
+        wait = t0 - issued_at
+        latency += bus_lat + wait
         self.stats.invalidations_or_updates += resp.inval_count
 
         victim.tag = tag
@@ -375,7 +363,6 @@ class L1Cache(Snooper):
         # BusWB is ignored by peers
         return (True, supplied, invalidated)
 
-# -------------------- Core + simulator --------------------
 @dataclass
 class SingleCoreCPU:
     l1: L1Cache
@@ -476,7 +463,6 @@ class Simulator:
             core.stats.idle_cycles += idle + 1
             core.time += latency
 
-# -------------------- CLI & Orchestration -----------------------------
 def human_bytes(n: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if n < 1024:
@@ -488,8 +474,8 @@ def main():
     ap = argparse.ArgumentParser(description="Trace-driven cache coherence simulator (MESI)")
     ap.add_argument("protocol", choices=["MESI", "Dragon"], help="Coherence protocol (Dragon not implemented; use MESI).")
     ap.add_argument("input_file", help="Benchmark base name (e.g., bodytrack, blackscholes, fluidanimate)")
-    ap.add_argument("cache_size", default = 4096, type=int, help="L1 size in bytes")
-    ap.add_argument("associativity", default = 2, type=int, help="L1 associativity")
+    ap.add_argument("cache_size", default=4096, type=int, help="L1 size in bytes")
+    ap.add_argument("associativity", default=2, type=int, help="L1 associativity")
     ap.add_argument("block_size", default=32, type=int, help="L1 block size in bytes")
     ap.add_argument("--traces-root", type=Path, default=None, help="Directory with *_N.data files")
     ap.add_argument("--num-cores", type=int, default=4, help="Number of cores to simulate")
@@ -497,31 +483,40 @@ def main():
 
     cfg = CacheConfig(size_bytes=args.cache_size, assoc=args.associativity, block_bytes=args.block_size)
 
-    # Simulator
+    # Build & run
     sim = Simulator(protocol=args.protocol, benchmark_base=args.input_file,
                     cfg=cfg, traces_root=args.traces_root, num_cores=args.num_cores)
+
+    print(f"Found {len(sim.traces)} trace file(s) for '{args.input_file}'.")
+
     sim.run()
 
-    # ----- Output (machine-readable-ish then human summary) -----
     print("==== RESULTS ====")
     print(f"protocol={args.protocol}")
     print(f"benchmark={args.input_file}")
     print(f"cache_size_bytes={cfg.size_bytes} assoc={cfg.assoc} block_bytes={cfg.block_bytes}")
 
-    # Overall
     overall_exec_cycles = max(core.time for core in sim.cores) if sim.cores else 0
     print(f"overall_exec_cycles={overall_exec_cycles}")
+
+    # Per-core stats blocks
     for i, core in enumerate(sim.cores):
         st = core.stats
-        print(f"core{i}_exec_cycles={core.time}")
+        print(f"--- Core {i} Stats ---")
         print(f"core{i}_compute_cycles={st.compute_cycles}")
         print(f"core{i}_loads={st.loads} core{i}_stores={st.stores}")
         print(f"core{i}_hits={st.hits} core{i}_misses={st.misses}")
         print(f"core{i}_idle_cycles={st.idle_cycles}")
-        print(f"core{i}_bus_data_traffic_bytes={st.bus_data_bytes} ({human_bytes(st.bus_data_bytes)})")
-        print(f"core{i}_mem_bytes={st.mem_data_bytes} c2c_bytes={st.c2c_data_bytes}")
-        print(f"core{i}_bus_invals_or_updates={st.invalidations_or_updates}")
-        print(f"core{i}_private_accesses={st.private_accesses} shared_accesses={st.shared_accesses}")
+        print(f"core{i}_private_accesses={st.private_accesses}")
+        print(f"core{i}_shared_accesses={st.shared_accesses}")
+
+    # Global bus stats = sum over cores (your model attributes bytes to the requester/evictor core)
+    total_bus_bytes = sum(c.stats.bus_data_bytes for c in sim.cores)
+    total_invals    = sum(c.stats.invalidations_or_updates for c in sim.cores)
+
+    print("--- Global Bus Stats ---")
+    print(f"bus_data_traffic_bytes={total_bus_bytes} ({human_bytes(total_bus_bytes)})")
+    print(f"bus_invals_or_updates={total_invals}")
 
 if __name__ == "__main__":
     main()
