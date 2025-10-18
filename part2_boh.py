@@ -206,6 +206,9 @@ class L1Cache:
         self.sets = [CacheSet([CacheLine() for _ in range(cfg.assoc)])
                      for _ in range(cfg.num_sets)]
 
+        # Maps block address -> victim line to be filled
+        self.pending_misses: Dict[int, CacheLine] = {}
+
     def _addr_fields(self, addr: int) -> Tuple[int, int, int]:
         off_mask = (1 << self.cfg.off_bits) - 1
         idx_mask = (1 << self.cfg.idx_bits) - 1
@@ -245,9 +248,27 @@ class L1Cache:
 
         if not line:  # Miss
             self.stats.misses += 1
+
+            victim = self._select_victim(idx)
+
+            # If victim is dirty, queue the blocking Flush
+            if victim.state == LineState.MODIFIED:
+                victim_addr = self._reconstruct_addr(victim.tag, idx)
+                self.bus.push_request(self.core_id, BusXact.Flush, victim_addr)
+
+            # Store this victim to be filled when the fetch completes
+            # We use the block-aligned address as the key
+            block_addr = addr & ~((1 << self.cfg.off_bits) - 1)
+            self.pending_misses[block_addr] = victim
+
+            # Mark victim as Invalid so it can't be snooped
+            victim.state = LineState.INVALID
+
+            # Queue the data fetch (BusRd or BusRdX)
             xact_type = BusXact.BusRd if is_load else BusXact.BusRdX
             self.bus.push_request(self.core_id, xact_type, addr)
-            return (False, 0)
+
+            return (False, 0)  # Stall
 
         # Hit
         self.stats.hits += 1
@@ -266,28 +287,32 @@ class L1Cache:
                 self._touch_lru(line)
                 return (True, HIT_CYCLES)
             elif line.state == LineState.SHARED:
-                # Upgrade S -> M. Need to invalidate others.
+                # Upgrade S -> M. We must stall and wait for the bus.
+                block_addr = addr & ~((1 << self.cfg.off_bits) - 1)
+                self.pending_misses[block_addr] = line
+                line.state = LineState.INVALID
                 self.bus.push_request(self.core_id, BusXact.BusRdX, addr)
                 return (False, 0)
 
     def complete_request(self, addr: int, final_state: str):
         """Callback from the bus when our memory request is done."""
         tag, idx, off = self._addr_fields(addr)
+        block_addr = addr & ~((1 << self.cfg.off_bits) - 1)
 
-        line = self._find_line(idx, tag)
-        if line and line.state == LineState.SHARED:  # S->M upgrade
-            line.state = LineState.MODIFIED
-            self._touch_lru(line)
-        else:  # Miss fill
-            victim = self._select_victim(idx)
-            if victim.state == LineState.MODIFIED:
-                victim_addr = self._reconstruct_addr(victim.tag, idx)
-                self.bus.push_request(self.core_id, BusXact.Flush, victim_addr)
+        if block_addr not in self.pending_misses:
+            # This should *really* not happen now
+            raise Exception(
+                f"Completed request for {addr:x} but no pending miss found.")
 
-            victim.tag = tag
-            victim.state = final_state
-            self._touch_lru(victim)
+        # 1. Retrieve the reserved line (either a new victim or the old S line)
+        line_to_fill = self.pending_misses.pop(block_addr)
 
+        # 2. Fill it with the new tag and state
+        line_to_fill.tag = tag
+        line_to_fill.state = final_state
+        self._touch_lru(line_to_fill)
+
+        # 3. Un-stall the CPU
         self.cpu.un_stall()
 
     def snoop(self, xact_type: str, addr: int) -> Optional[str]:
@@ -530,6 +555,7 @@ def main():
     ap.add_argument("block_size", type=int, help="L1 block size in bytes")
     ap.add_argument("--traces-root", type=Path, default=None,
                     help="Directory with *.data files")
+
     args = ap.parse_args()
 
     if args.protocol == "Dragon":
