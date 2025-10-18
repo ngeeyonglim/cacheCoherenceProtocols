@@ -150,6 +150,8 @@ class Bus:
                 snoop_responses.append(snooper.snoop(xact_type, addr))
 
         was_dirty = LineState.MODIFIED in snoop_responses
+        was_exclusive = LineState.EXCLUSIVE in snoop_responses
+        data_supplied_by_cache = was_dirty or was_exclusive
         is_shared = any(r is not None for r in snoop_responses)
 
         latency = 0
@@ -157,7 +159,7 @@ class Bus:
         words_per_block = self.snoopers[0].cfg.words_per_block
 
         if xact_type == BusXact.BusRd:
-            if was_dirty or is_shared:
+            if data_supplied_by_cache:
                 latency = C2C_WORD_CYCLES * words_per_block
                 self.g_stats.bus_data_bytes += block_bytes
             else:
@@ -273,26 +275,30 @@ class L1Cache:
         # Hit
         self.stats.hits += 1
 
-        if line.state in (LineState.EXCLUSIVE, LineState.MODIFIED):
-            self.stats.private_accesses += 1
-        else:  # Shared
-            self.stats.shared_accesses += 1
-
         if is_load:  # Load Hit
+            if line.state in (LineState.EXCLUSIVE, LineState.MODIFIED):
+                self.stats.private_accesses += 1
+            else:  # Shared
+                self.stats.shared_accesses += 1
+
             self._touch_lru(line)
             return (True, HIT_CYCLES)
+
         else:  # Store Hit
             if line.state in (LineState.MODIFIED, LineState.EXCLUSIVE):
+                self.stats.private_accesses += 1
+
                 line.state = LineState.MODIFIED
                 self._touch_lru(line)
                 return (True, HIT_CYCLES)
+
             elif line.state == LineState.SHARED:
-                # Upgrade S -> M. We must stall and wait for the bus.
+                # This is a stalling hit (S->M upgrade)
                 block_addr = addr & ~((1 << self.cfg.off_bits) - 1)
                 self.pending_misses[block_addr] = line
                 line.state = LineState.INVALID
                 self.bus.push_request(self.core_id, BusXact.BusRdX, addr)
-                return (False, 0)
+                return (False, 0)  # Stall
 
     def complete_request(self, addr: int, final_state: str):
         """Callback from the bus when our memory request is done."""
@@ -300,19 +306,21 @@ class L1Cache:
         block_addr = addr & ~((1 << self.cfg.off_bits) - 1)
 
         if block_addr not in self.pending_misses:
-            # This should *really* not happen now
             raise Exception(
                 f"Completed request for {addr:x} but no pending miss found.")
 
-        # 1. Retrieve the reserved line (either a new victim or the old S line)
+        # Retrieve the reserved line (either a new victim or the old S line)
         line_to_fill = self.pending_misses.pop(block_addr)
 
-        # 2. Fill it with the new tag and state
         line_to_fill.tag = tag
         line_to_fill.state = final_state
         self._touch_lru(line_to_fill)
 
-        # 3. Un-stall the CPU
+        if final_state in (LineState.MODIFIED, LineState.EXCLUSIVE):
+            self.stats.private_accesses += 1
+        elif final_state == LineState.SHARED:
+            self.stats.shared_accesses += 1
+
         self.cpu.un_stall()
 
     def snoop(self, xact_type: str, addr: int) -> Optional[str]:
@@ -361,7 +369,7 @@ class TraceReader:
 @dataclass
 class CPU:
     core_id: int
-    l1: L1Cache  # Will be set by Simulator after init
+    l1: L1Cache
     stats: CacheStats
     tr: TraceReader
     sim: 'Simulator'
@@ -372,8 +380,7 @@ class CPU:
     finish_time: int = 0
 
     def is_finished(self) -> bool:
-        # Core is finished if its trace is done AND it's not stalled
-        # waiting for a final memory operation.
+        # Core is finished if its trace is done AND it's not stalled waiting for a final memory operation.
         return self.tr.finished and not self.stalled
 
     def execute(self):
@@ -418,7 +425,7 @@ class CPU:
     def un_stall(self):
         """Callback from L1Cache when a request is complete."""
         if not self.stalled:
-            return  # Should not happen
+            return
 
         self.stalled = False
 
@@ -433,7 +440,7 @@ class CPU:
             # This was the last op. Record finish time.
             self.finish_time = self.sim.current_time
         else:
-            # Schedule the next instruction to execute *now*
+            # Schedule the next instruction to execute
             self.sim.schedule(0, self.execute)
 
 
@@ -452,7 +459,6 @@ class Simulator:
 
         for i, path in enumerate(trace_paths):
             stats = CacheStats()
-            # Create CPU and Cache, then link them
             cpu = CPU(i, None, stats, TraceReader(path), self)
             cache = L1Cache(i, cfg, stats, self.bus, self.g_stats, cpu)
             cpu.l1 = cache  # Set the back-link
@@ -493,10 +499,8 @@ class Simulator:
     def run(self):
         """Main discrete event simulation loop."""
         while self.event_queue:
-            # Get the next event
             (time, _id, callback, args) = heapq.heappop(self.event_queue)
 
-            # Advance global time to the event's time
             self.current_time = time
 
             # Execute the event
