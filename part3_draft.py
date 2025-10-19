@@ -117,13 +117,12 @@ class BusResp:
 
 class Snooper:
     """Interface implemented by each L1 for snoop callbacks."""
-    def on_snoop(self, txn: BusTxn) -> Tuple[bool, bool, bool, str]:
+    def on_snoop(self, txn: BusTxn) -> Tuple[bool, bool, bool]:
         """
         Return (had_line, supplied_data, invalidated)
         - had_line: cache had the block in {S,E,M}
         - supplied_data: true if we flushed the block on this txn
         - invalidated: true if we transitioned to I due to this txn
-        - prev_state: state BEFORE applyign the snoop
         """
         raise NotImplementedError
 
@@ -152,21 +151,17 @@ class Bus:
         owner_supplies = False
         inval_count = 0
 
-        dirty_owner_core = None
-
         # broadcast snoop to other caches
         for cid, snp in enumerate(self.snoopers):
             if cid == txn.src_core:
                 continue
-            had, supplied, invalidated, prev= snp.on_snoop(txn) # check behaviour of the other caches 
+            had, supplied, invalidated = snp.on_snoop(txn) # check behaviour of the other caches 
             if had:
                 shared = True
             if supplied:
                 owner_supplies = True
             if invalidated:
                 inval_count += 1
-            if prev == MESI.MODIFIED:
-                dirty_owner_core = cid
 
         # Decide data source + latency and account data traffic
         if txn.ttype == BusTxnType.BusUpg: # busupg for S -> M, as the request core doesnt need to get data
@@ -179,47 +174,18 @@ class Bus:
             self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
             self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
         else:
-            # Data-carrying
-            if txn.ttype == BusTxnType.BusRd:
-                # NEW POLICY: If an owner had M, do WB(100) THEN C2C(2N).
-                if owner_supplies:
-                    words = self._block_words()
-                    if dirty_owner_core is not None:
-                        # 1) Explicit write-back to memory (100), attributed to dirty owner
-                        latency = DIRTY_EVICT_TO_MEM_CYCLES
-                        self.stats_per_core[dirty_owner_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[dirty_owner_core].mem_data_bytes += self.cfg.block_bytes
-                        # 2) Then C2C transfer to requester (2N), attributed to requester
-                        latency += C2C_WORD_CYCLES * words
-                        self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                        data_source = 'c2c'
-                    else:
-                        # Supplier was E (clean): C2C only
-                        latency = C2C_WORD_CYCLES * words
-                        data_source = 'c2c'
-                        self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                else:
-                    # No supplier: fetch from memory (100)
-                    latency = MEM_FETCH_BLOCK_CYCLES
-                    data_source = 'mem'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
-
-            elif txn.ttype == BusTxnType.BusRdX:
-                # KEEP existing behavior for BusRdX (owner may supply C2C or memory)
-                words = self._block_words()
-                if owner_supplies:
-                    latency = C2C_WORD_CYCLES * words
-                    data_source = 'c2c'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                else:
-                    latency = MEM_FETCH_BLOCK_CYCLES
-                    data_source = 'mem'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
+            # Data-carrying (BusRd / BusRdX)
+            # flow based on which method of data transfer 
+            if owner_supplies: # E or M
+                latency = C2C_WORD_CYCLES * self._block_words()
+                data_source = 'c2c'
+                self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
+                self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
+            else: # if there is other cores with the same block, then memory
+                latency = MEM_FETCH_BLOCK_CYCLES
+                data_source = 'mem'
+                self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
+                self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
 
         # Reserve bus and finish
         total_latency = latency  # bus occupancy for payload/control
@@ -366,11 +332,10 @@ class L1Cache(Snooper):
         tag, idx, _ = self._addr_fields(txn.addr)
         line = self._find_line(idx, tag)
         if not line:
-            return (False, False, False, MESI.INVALID)
+            return (False, False, False)
 
         supplied = False
         invalidated = False
-        prev = line.state
 
         if txn.ttype == BusTxnType.BusRd:
             if line.state == MESI.MODIFIED:
@@ -396,7 +361,7 @@ class L1Cache(Snooper):
                 line.state = MESI.INVALID
                 invalidated = True
         # BusWB is ignored by peers
-        return (True, supplied, invalidated, prev)
+        return (True, supplied, invalidated)
 
 @dataclass
 class SingleCoreCPU:
@@ -489,7 +454,7 @@ class Simulator:
             core = self.cores[cid]
             label, value = self.traces[cid][self.ptrs[cid]]
 
-            # self._print_pre_action(cid, label, value)
+            self._print_pre_action(cid, label, value)
             self.ptrs[cid] += 1
 
             if label == OTHER:
