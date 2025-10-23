@@ -169,64 +169,42 @@ class Bus:
                 dirty_owner_core = cid
 
         # Decide data source + latency and account data traffic
-        if txn.ttype == BusTxnType.BusUpg: # busupg for S -> M, as the request core doesnt need to get data
-            latency = 1  # control only
+        if txn.ttype == BusTxnType.BusUpg:
+            latency = 1
             data_source = 'mem'  # placeholder
+
         elif txn.ttype == BusTxnType.BusWB:
             latency = DIRTY_EVICT_TO_MEM_CYCLES
             data_source = 'mem'
-            # Attribute writeback bytes to the evicting core
             self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
             self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
-        else:
-            # Data-carrying
-            if txn.ttype == BusTxnType.BusRd:
-                # NEW POLICY: If an owner had M, do WB(100) THEN C2C(2N).
-                if owner_supplies:
-                    words = self._block_words()
-                    if dirty_owner_core is not None:
-                        # 1) Explicit write-back to memory (100), attributed to dirty owner
-                        latency = DIRTY_EVICT_TO_MEM_CYCLES
-                        self.stats_per_core[dirty_owner_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[dirty_owner_core].mem_data_bytes += self.cfg.block_bytes
-                        # 2) Then C2C transfer to requester (2N), attributed to requester
-                        latency += C2C_WORD_CYCLES * words
-                        self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                        data_source = 'c2c'
-                    else:
-                        # Supplier was E (clean): C2C only
-                        latency = C2C_WORD_CYCLES * words
-                        data_source = 'c2c'
-                        self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                        self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                else:
-                    # No supplier: fetch from memory (100)
-                    latency = MEM_FETCH_BLOCK_CYCLES
-                    data_source = 'mem'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
 
-            elif txn.ttype == BusTxnType.BusRdX:
-                # KEEP existing behavior for BusRdX (owner may supply C2C or memory)
-                words = self._block_words()
-                if owner_supplies:
-                    latency = C2C_WORD_CYCLES * words
-                    data_source = 'c2c'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
-                else:
-                    latency = MEM_FETCH_BLOCK_CYCLES
-                    data_source = 'mem'
-                    self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
-                    self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
+        else:
+            # No-intervention: memory always serves the requester.
+            # If any snooper had M before the snoop, that owner must write back first.
+            latency = 0
+            data_source = 'mem'
+
+            if dirty_owner_core is not None:
+                # Explicit WB by the dirty owner
+                latency += DIRTY_EVICT_TO_MEM_CYCLES
+                self.stats_per_core[dirty_owner_core].bus_data_bytes += self.cfg.block_bytes
+                self.stats_per_core[dirty_owner_core].mem_data_bytes += self.cfg.block_bytes
+
+            # Requester fetches from memory
+            latency += MEM_FETCH_BLOCK_CYCLES
+            self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
+            self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
+
 
         # Reserve bus and finish
-        total_latency = latency  # bus occupancy for payload/control
+        total_latency = latency
         self.free_at = t0 + total_latency
-        resp = BusResp(shared=shared, owner_supplies=owner_supplies,
-                       inval_count=inval_count, data_source=data_source)
+
+        resp = BusResp(shared=shared, owner_supplies=False,  # no C2C in no-intervention
+                    inval_count=inval_count, data_source='mem')
         return resp, total_latency, t0
+
 
 class L1Cache(Snooper):
     def __init__(self, cfg: CacheConfig, stats: CacheStats, core_id: int, bus: Bus):
@@ -368,35 +346,30 @@ class L1Cache(Snooper):
         if not line:
             return (False, False, False, MESI.INVALID)
 
-        supplied = False
+        supplied = False          # no-intervention: never supply data
         invalidated = False
-        prev = line.state
+        prev = line.state         # capture BEFORE state
 
         if txn.ttype == BusTxnType.BusRd:
             if line.state == MESI.MODIFIED:
-                # Flush data to bus; M->S
-                supplied = True
                 line.state = MESI.SHARED
             elif line.state == MESI.EXCLUSIVE:
-                # Flush data to bus; E->S (C2C enabled per user)
-                supplied = True
                 line.state = MESI.SHARED
             # S stays S
-            # I no-op
+
         elif txn.ttype == BusTxnType.BusRdX:
-            if line.state == MESI.MODIFIED:
-                supplied = True
+            if line.state in (MESI.MODIFIED, MESI.EXCLUSIVE, MESI.SHARED):
                 line.state = MESI.INVALID
                 invalidated = True
-            elif line.state in (MESI.EXCLUSIVE, MESI.SHARED):
-                line.state = MESI.INVALID
-                invalidated = True
+
         elif txn.ttype == BusTxnType.BusUpg:
             if line.state == MESI.SHARED:
                 line.state = MESI.INVALID
                 invalidated = True
-        # BusWB is ignored by peers
+
+        # BusWB ignored by peers
         return (True, supplied, invalidated, prev)
+
 
 @dataclass
 class SingleCoreCPU:
