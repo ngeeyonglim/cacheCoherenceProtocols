@@ -265,6 +265,9 @@ class L1Cache(Snooper):
         tag = addr >> (self.cfg.off_bits + self.cfg.idx_bits)
         return tag, idx, off
 
+    def _reconstruct_addr(self, tag: int, idx: int) -> int:
+        return (tag << (self.cfg.idx_bits + self.cfg.off_bits)) | (idx << self.cfg.off_bits)
+
     def _find_line(self, idx: int, tag: int) -> Optional[CacheLine]:
         for line in self.sets[idx].lines:
             if line.state != MESI.INVALID and line.tag == tag:
@@ -302,7 +305,9 @@ class L1Cache(Snooper):
         # Evict M -> BusWB (to memory)
         if victim.state == MESI.MODIFIED:
             # addr unused for WB payload here
-            txn = BusTxn(BusTxnType.BusWB, addr=(0), src_core=self.core_id)
+            victim_addr = self._reconstruct_addr(victim.tag, idx)
+            txn = BusTxn(BusTxnType.BusWB, addr=victim_addr,
+                         src_core=self.core_id)
             _, wb_lat, _ = self.bus.request(
                 txn, start_time=core_time + latency)
             latency += wb_lat
@@ -365,7 +370,9 @@ class L1Cache(Snooper):
         latency = 0
         # Evict M victim if needed
         if victim.state == MESI.MODIFIED:
-            txn = BusTxn(BusTxnType.BusWB, addr=(0), src_core=self.core_id)
+            victim_addr = self._reconstruct_addr(victim.tag, idx)
+            txn = BusTxn(BusTxnType.BusWB, addr=victim_addr,
+                         src_core=self.core_id)
             _, wb_lat, _ = self.bus.request(
                 txn, start_time=core_time + latency)
             latency += wb_lat
@@ -410,11 +417,11 @@ class L1Cache(Snooper):
             # S stays S
             # I no-op
         elif txn.ttype == BusTxnType.BusRdX:
-            if line.state == MESI.MODIFIED:
+            if line.state in (MESI.MODIFIED, MESI.EXCLUSIVE):
                 supplied = True
                 line.state = MESI.INVALID
                 invalidated = True
-            elif line.state in (MESI.EXCLUSIVE, MESI.SHARED):
+            elif line.state == MESI.SHARED:
                 line.state = MESI.INVALID
                 invalidated = True
         elif txn.ttype == BusTxnType.BusUpg:
