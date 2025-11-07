@@ -187,11 +187,11 @@ class Bus:
 
         dirty_owner_core = None
 
-        # broadcast snoop to other caches
+        # checks all caches for whether they have the relevant data
         for cid, snp in enumerate(self.snoopers):
             if cid == txn.src_core:
                 continue
-            # MODIFIED: Renamed 'invalidated' to 'peer_changed'
+
             had, supplied, peer_changed, prev = snp.on_snoop(
                 txn)  # check behaviour of the other caches
             if had:
@@ -493,7 +493,7 @@ class L1Cache(Snooper):
                 self.stats.hits += 1
                 latency = 0
 
-                if line.state == MESI.MODIFIED:
+                if line.state == Dragon.MODIFIED:
                     # M -> M (silent)
                     self._touch_lru(line)
                     self.stats.private_accesses += 1
@@ -515,9 +515,12 @@ class L1Cache(Snooper):
                 latency = bus_lat + wait
                 self.stats.invalidations_or_updates += resp.inval_count
 
-                if line.state == Dragon.SHARED_CLEAN:
-                    # Sc -> Sm
+                if resp.shared:
+                    # Others still have it, become/stay Sm
                     line.state = Dragon.SHARED_MODIFIED
+                else:
+                    # No one else has it, become M
+                    line.state = Dragon.MODIFIED
 
                 self._touch_lru(line)
                 self.stats.shared_accesses += 1
@@ -629,6 +632,11 @@ class L1Cache(Snooper):
             elif txn.ttype == BusTxnType.BusUpd:
                 if line.state == Dragon.SHARED_CLEAN:
                     # Sc -> Sc, update word
+                    updated = True
+                elif line.state == Dragon.SHARED_MODIFIED:
+                    # A peer (Sc) wrote and is becoming the new Sm.
+                    # We update our data and relinquish ownership.
+                    line.state = Dragon.SHARED_CLEAN
                     updated = True
                 # Sm, M, E should not see BusUpd for their own lines
 

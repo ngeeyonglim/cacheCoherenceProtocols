@@ -531,7 +531,7 @@ def main():
         print(f"core{i}_shared_accesses={st.shared_accesses}")
 
     # Global bus stats = sum over cores (your model attributes bytes to the requester/evictor core)
-    total_bus_bytes = sum(c.stats.bus_data_bytes for c in sim.cores)
+    total_bus_bytes = sum(c.stats.cd for c in sim.cores)
     total_invals    = sum(c.stats.invalidations_or_updates for c in sim.cores)
 
     print("--- Global Bus Stats ---")
