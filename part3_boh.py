@@ -93,8 +93,8 @@ class CacheStats:
     invalidations_or_updates: int = 0
     private_accesses: int = 0          # accesses to E/M, and installs of E/M
     shared_accesses: int = 0           # accesses to S/Sc/Sm, and installs of S/Sc/Sm
-    mem_data_bytes: int = 0            # optional: memory-sourced bytes
-    c2c_data_bytes: int = 0            # optional: c2c-sourced bytes
+    mem_data_bytes: int = 0            # memory-sourced bytes
+    c2c_data_bytes: int = 0            # c2c-sourced bytes
 
 
 class LRU:
@@ -138,7 +138,7 @@ class BusTxn:
 class BusResp:
     shared: bool
     owner_supplies: bool
-    inval_count: int  # Renamed in logic to inval_or_update_count
+    inval_count: int
     data_source: Literal['mem', 'c2c']
 
 
@@ -152,7 +152,7 @@ class Snooper:
         - supplied_data: true if we flushed the block on this txn
         - invalidated_or_updated: true if we transitioned to I (MESI)
                                   or updated block (Dragon) due to this txn
-        - prev_state: state BEFORE applyign the snoop
+        - prev_state: state BEFORE applying the snoop
         """
         raise NotImplementedError
 
@@ -183,7 +183,7 @@ class Bus:
         t0 = max(start_time, self.free_at)
         shared = False
         owner_supplies = False
-        inval_or_update_count = 0  # MODIFIED: Renamed variable
+        inval_or_update_count = 0
 
         dirty_owner_core = None
 
@@ -226,36 +226,33 @@ class Bus:
         else:
             # Data-carrying
             if txn.ttype == BusTxnType.BusRd:
-
-                # MODIFIED: Protocol-specific BusRd logic
                 if self.protocol == "MESI":
                     if owner_supplies:
                         words = self._block_words()
                         if dirty_owner_core is not None:
-                            # 1) Explicit write-back to memory (100), attributed to dirty owner
+                            # Explicit write-back to memory (100), attributed to dirty owner
                             latency = DIRTY_EVICT_TO_MEM_CYCLES
                             self.stats_per_core[dirty_owner_core].bus_data_bytes += self.cfg.block_bytes
                             self.stats_per_core[dirty_owner_core].mem_data_bytes += self.cfg.block_bytes
-                            # 2) Then C2C transfer to requester (2N), attributed to requester
+                            # Then C2C transfer to requester (2N), attributed to requester
                             latency += C2C_WORD_CYCLES * words
                             self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
                             self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
                             data_source = 'c2c'
                         else:
-                            # Supplier was E (clean): C2C only
+                            # Supplier was E, C2C only
                             latency = C2C_WORD_CYCLES * words
                             data_source = 'c2c'
                             self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
                             self.stats_per_core[txn.src_core].c2c_data_bytes += self.cfg.block_bytes
                     else:
-                        # No supplier: fetch from memory (100)
+                        # No supplier, fetch from memory (100)
                         latency = MEM_FETCH_BLOCK_CYCLES
                         data_source = 'mem'
                         self.stats_per_core[txn.src_core].bus_data_bytes += self.cfg.block_bytes
                         self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
 
                 elif self.protocol == "Dragon":
-                    # NEW: Dragon BusRd logic
                     words = self._block_words()
                     if owner_supplies:  # Supplied by E, M, or Sm
                         latency = C2C_WORD_CYCLES * words
@@ -269,8 +266,6 @@ class Bus:
                         self.stats_per_core[txn.src_core].mem_data_bytes += self.cfg.block_bytes
 
             elif txn.ttype == BusTxnType.BusRdX:
-                # KEEP existing behavior for BusRdX (owner may supply C2C or memory)
-                # (Dragon protocol does not use BusRdX)
                 words = self._block_words()
                 if owner_supplies:
                     latency = C2C_WORD_CYCLES * words
