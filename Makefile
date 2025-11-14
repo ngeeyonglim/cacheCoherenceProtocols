@@ -1,5 +1,5 @@
 PYTHON = python3
-SCRIPT = part2.py
+SCRIPT = part3.py
 EXEC = coherence
 
 # Default arguments (can be overridden by user at make command line)
